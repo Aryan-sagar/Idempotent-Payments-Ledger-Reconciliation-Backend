@@ -1,0 +1,6 @@
+-r requirements.txt
+
+# Test-only dependencies. Not needed to run the API, only to test it.
+pytest==8.3.3
+httpx==0.28.1       # required by fastapi.testclient.TestClient
+fakeredis==2.37.1   # in-memory Redis stand-in so tests don't need a live Redis server
