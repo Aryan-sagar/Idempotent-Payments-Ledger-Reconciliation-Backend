@@ -1,6 +1,3 @@
-Absolutely. Here’s a **README.md you can copy-paste directly** for the current shipped version.
-
-````markdown
 # Payments Ledger
 
 A production-oriented payments ledger built with **FastAPI, PostgreSQL, Redis, SQLAlchemy, and Alembic**.
