@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.idempotency import IdempotencyConflict, IdempotencyInProgress
-from app.ledger import ConcurrentModification, InvalidTransition
+from app.ledger import AccountNotFound, ConcurrentModification, InvalidTransition
 from app.routes_payments import router as payments_router
 
 app = FastAPI(title="Idempotent Payments Ledger")
@@ -30,6 +30,11 @@ def handle_invalid_transition(request: Request, exc: InvalidTransition):
 @app.exception_handler(ConcurrentModification)
 def handle_concurrent_modification(request: Request, exc: ConcurrentModification):
     return JSONResponse(status_code=409, content={"detail": str(exc)})
+
+
+@app.exception_handler(AccountNotFound)
+def handle_account_not_found(request: Request, exc: AccountNotFound):
+    return JSONResponse(status_code=404, content={"detail": str(exc)})
 
 
 @app.get("/health")

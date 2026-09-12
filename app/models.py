@@ -25,7 +25,7 @@ class Account(Base):
     __tablename__ = "accounts"
 
     id = Column(String, primary_key=True, default=gen_uuid)
-    owner = Column(String, nullable=False)
+    owner = Column(String, nullable=False, unique=True)
     balance_cache = Column(Numeric(precision=18, scale=2), nullable=False, default=0)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
