@@ -177,7 +177,23 @@ WHERE
 
 If another request has already modified the transaction, the update affects zero rows and the operation is rejected.
 
-Account balance updates use row-level locking to prevent concurrent balance corruption.
+Account balance updates are done as a single atomic SQL statement (`balance_cache = balance_cache +/- amount`) rather than a Python read-modify-write, so the read and write happen inside one database-engine step instead of two round trips that concurrent requests could interleave. See [Known Failure Modes](#known-failure-modes--fixes) below for the earlier version of this that didn't do that, and why it mattered.
+
+---
+
+## Known Failure Modes & Fixes
+
+This project went through a deliberate pass of asking "where does this break under concurrent load or a mid-transaction crash," rather than stopping once the happy path worked. These are the failure modes found, confirmed by tracing through the actual code, and fixed:
+
+| # | Failure mode | Why it mattered | Fix |
+|---|---|---|---|
+| 1 | **`Account.balance_cache` lost-update race.** The original code read a balance into Python, mutated it, and wrote it back (`db.get()` → `acc.balance_cache -= amount` → commit). Two concurrent postings to the *same* account — the escrow account is shared by every transaction in the system, so this is normal load, not an edge case — could both read the same starting value and one commit would silently discard the other's update. Nothing raised an exception; the ledger entries stayed correct and append-only, but the cached balance just became wrong. | Silent financial data corruption with no error signal, in the most contended row in the schema. | `post_ledger_pair` now issues `UPDATE accounts SET balance_cache = balance_cache +/- :amount WHERE id = :id` as one SQL statement, so the read and write are atomic at the database engine level. Proven by `tests/test_concurrency_balance_race.py`, which runs concurrent transfers from multiple threads and asserts no update is lost. |
+| 2 | **Escrow account duplication.** A migration named `make_account_owner_unique` had an empty body — no constraint was ever created. `get_or_create_escrow_account()`'s existence check had no protection against two concurrent callers both finding "no escrow account" and both inserting one. `.first()` with no deterministic ordering would then arbitrarily pick between two "the same" account. | Money could be split across two rows that the system treats as one account. | Added `uq_accounts_owner` via a real migration, `unique=True` on the model, and a race-safe create path that catches the `IntegrityError` from losing a concurrent insert race and uses the winner's row instead of erroring. |
+| 3 | **No crash-recovery path for a stuck transaction.** A transaction transitions `created → authorized` (committed on its own) then `authorized → captured` + ledger postings (committed together). A crash between those two commits left a transaction permanently stuck in `authorized`; retrying with the same idempotency key tried to `INSERT` a second `Transaction` row with the same key, hit the unique constraint, and surfaced as an unhandled 500 instead of a safe replay. | A single mid-flight crash converted "the client should just retry" into "this payment can never be retried again." | `create_and_capture_payment` now looks up an existing row by idempotency key before creating one, and — if found — resumes the state machine from wherever it stopped instead of attempting a second insert. |
+| 4 | **Idempotency lock TTL vs. request duration.** The Redis "in progress" lock expires after 30s. If business logic legitimately takes longer than that (DB contention, slow query), a retry arriving in that window no longer sees the lock as held and re-enters the "crashed prior attempt" recovery branch concurrently with the still-running original attempt. | A slow request, not just a crashed one, could trigger a duplicate-processing attempt. | Mitigated by fix #3 above: the resumable state machine means a second concurrent call for the same key converges on the same transaction (or safely loses an insert race) instead of double-processing. |
+| 5 | Redis was written as a "fast-path" response cache (`store_idempotent_response`) but never read anywhere — `check_idempotency` always went to Postgres regardless. | The two-layer Redis/Postgres strategy described in this README wasn't actually wired up on the read side. | `check_idempotency` now checks the Redis cache first (as a hash-validated envelope, so a key reused with a different body is still rejected) before touching Postgres. |
+
+None of the above raised an exception or failed a test before being found — they're the class of bug that only shows up as a discrepancy days later, which is exactly what `app/reconciliation.py` (see below) exists to catch independently of whatever the application layer believes.
 
 ---
 
@@ -380,14 +396,27 @@ Current test coverage validates:
 * double-entry accounting
 * balance correctness
 * append-only ledger behavior
-* concurrency regression behavior
+* concurrency regression behavior on transaction state (`test_ledger.py`)
+* concurrency regression behavior on account balances (`test_concurrency_balance_race.py`)
+* reconciliation invariant checks: global balance, per-account drift, duplicate accounts (`test_reconciliation.py`)
 
-Current checkpoint:
+---
 
-```text
-15+ tests passed
-0 failed
+## Reconciliation
+
+`app/reconciliation.py` independently re-derives the ledger's invariants instead of trusting the application layer's bookkeeping:
+
+* **Global balance** — `SUM(debits) == SUM(credits)` across every ledger entry ever posted. This is the one invariant double-entry accounting exists to guarantee.
+* **Per-account drift** — recomputes each account's balance from its `ledger_entries` and compares it against the cached `balance_cache` column, surfacing exactly the kind of silent drift the balance-race bug (see above) used to cause.
+* **Duplicate accounts** — flags any `owner` value with more than one account row, independently of whether the unique constraint is actually in place in a given database.
+
+Run it standalone against the configured database:
+
+```bash
+python -m app.reconciliation
 ```
+
+Exits `0` with `CLEAN` if nothing is wrong, `1` with an itemized discrepancy report otherwise — suitable for a scheduled job or a CI/deploy gate.
 
 ---
 
@@ -444,19 +473,26 @@ State changes and corresponding ledger movements are committed atomically whenev
 * [x] Escrow account
 * [x] Settlement
 * [x] Refunds
-* [x] Optimistic locking
-* [x] Balance concurrency protection
+* [x] Optimistic locking (transaction state)
+* [x] Atomic balance updates (fixed a real lost-update race — see Known Failure Modes)
+* [x] GET payment endpoint
+* [x] Settlement/refund API routes
 * [x] Integration tests
-* [x] Concurrency regression tests
+* [x] Concurrency regression tests (transaction state *and* account balances)
+* [x] Race-safe escrow account creation + real unique constraint
+* [x] Crash-recoverable payment creation (resumable state machine, no stuck transactions)
+* [x] Reconciliation module (global balance, per-account drift, duplicate-account detection)
+* [x] AccountNotFound / 404 handling on bad account ids in ledger postings
 
 ### Planned
 
-* [ ] Complete GET payment endpoint
-* [ ] Complete settlement/refund API routes
-* [ ] Production Dockerfile
-* [ ] Full Docker Compose application stack
-* [ ] Improved exception handling
-* [ ] Additional database indexes
+* [ ] Production Dockerfile (currently empty)
+* [ ] Full Docker Compose application stack (currently only `db`/`redis` are wired for local dev)
+* [ ] Webhook simulation on payment lifecycle events
+* [ ] Rate limiting on the payments API
+* [ ] Scheduled reconciliation job (cron/worker running `app/reconciliation.py` on an interval, alerting on non-`CLEAN` results, rather than a manual CLI run)
+* [ ] Outbox pattern for anything that needs to notify an external system on commit, so notification and ledger state can't diverge across a crash
+* [ ] Additional database indexes (e.g. `transactions.status` for reconciliation queries at scale)
 * [ ] Dependency cleanup
 * [ ] Production configuration
 * [ ] API documentation
